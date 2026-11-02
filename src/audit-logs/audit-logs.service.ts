@@ -21,6 +21,7 @@ import {
 } from './entities/audit-log-schedule.entity';
 import { AuditLog } from './entities/audit-log.entity';
 import { ConfigService } from '@nestjs/config';
+import { toCsvRow } from '../common/utils/csv.util';
 
 @Injectable()
 export class AuditLogsService {
@@ -120,15 +121,6 @@ export class AuditLogsService {
    */
   getClientIp(request: any): string {
     if (!request) return '';
-
-    const xForwardedFor = request.headers?.['x-forwarded-for'];
-
-    if (Array.isArray(xForwardedFor)) {
-      return xForwardedFor[0] || '';
-    } else if (typeof xForwardedFor === 'string') {
-      return xForwardedFor.split(',')[0].trim() || '';
-    }
-
     return request.ip || request.socket?.remoteAddress || '';
   }
 
@@ -423,20 +415,33 @@ export class AuditLogsService {
     filename: string;
   } {
     const now = new Date();
-    let csv =
-      'Timestamp,User ID,Action,Entity,Entity ID,IP Address,User Agent\n';
+    const header = toCsvRow([
+      'Timestamp',
+      'User ID',
+      'Action',
+      'Entity',
+      'Entity ID',
+      'IP Address',
+      'User Agent',
+    ]);
+    const rows = [header];
 
     for (const log of logs) {
       const timestamp = format(new Date(log.createdAt), 'yyyy-MM-dd HH:mm:ss');
-      const userId = log.userId || '';
-      const action = log.action.replace(/"/g, '""'); // escape quotes
-      const entity = log.entity;
-      const entityId = log.entityId || '';
-      const ip = log.ipAddress || '';
-      const userAgent = (log.userAgent || '').replace(/"/g, '""');
-
-      csv += `"${timestamp}","${userId}","${action}","${entity}","${entityId}","${ip}","${userAgent}"\n`;
+      rows.push(
+        toCsvRow([
+          timestamp,
+          log.userId || '',
+          log.action || '',
+          log.entity || '',
+          log.entityId || '',
+          log.ipAddress || '',
+          log.userAgent || '',
+        ]),
+      );
     }
+
+    const csv = rows.join('\n') + '\n';
 
     return {
       buffer: Buffer.from(csv, 'utf-8'),

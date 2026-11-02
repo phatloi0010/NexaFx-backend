@@ -32,6 +32,30 @@ async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const configService = app.get(ConfigService);
 
+  // Configure Express 'trust proxy' so req.ip resolves accurately behind reverse proxies
+  const trustProxyConfig =
+    configService.get<string | number | boolean>('TRUST_PROXY_HOPS') ??
+    configService.get<string | number | boolean>('TRUST_PROXY');
+  if (trustProxyConfig !== undefined && trustProxyConfig !== '') {
+    if (
+      typeof trustProxyConfig === 'number' ||
+      typeof trustProxyConfig === 'boolean'
+    ) {
+      app.set('trust proxy', trustProxyConfig);
+    } else {
+      const hops = Number(trustProxyConfig);
+      if (!Number.isNaN(hops)) {
+        app.set('trust proxy', hops);
+      } else if (trustProxyConfig === 'true') {
+        app.set('trust proxy', true);
+      } else if (trustProxyConfig === 'false') {
+        app.set('trust proxy', false);
+      } else {
+        app.set('trust proxy', trustProxyConfig);
+      }
+    }
+  }
+
   // Trace Correlation & Request ID Context Propagation Middleware
   app.use((req: Request, res: Response, next: NextFunction) => {
     // Validated: the value is echoed into log lines, so a client-supplied

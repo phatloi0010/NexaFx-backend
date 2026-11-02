@@ -35,6 +35,7 @@ import {
 } from 'date-fns';
 import { MetricsQueryDto } from './dto/metrics-query.dto';
 import * as csv from 'fast-csv';
+import { sanitizeCsvValue } from '../common/utils/csv.util';
 import { OverrideTransactionDto } from './dto/override-transaction.dto';
 import { Response } from 'express';
 import { KycRecord, KycStatus } from '../kyc/entities/kyc.entity';
@@ -853,7 +854,16 @@ export class AdminService {
       'attachment; filename="audit-logs.csv"',
     );
 
-    const csvStream = csv.format({ headers: true });
+    const csvStream = csv.format({
+      headers: true,
+      transform: (row: Record<string, any>) => {
+        const sanitized: Record<string, any> = {};
+        for (const [key, value] of Object.entries(row)) {
+          sanitized[key] = sanitizeCsvValue(value);
+        }
+        return sanitized;
+      },
+    });
     csvStream.pipe(response);
 
     const queryBuilder = this.auditLogRepository
@@ -873,15 +883,17 @@ export class AdminService {
       const queryStream = await queryBuilder.stream();
       for await (const row of queryStream) {
         csvStream.write({
-          createdAt: row.audit_log_createdAt
-            ? new Date(row.audit_log_createdAt).toISOString()
-            : '',
-          actorId: row.audit_log_actorId || '',
-          action: row.audit_log_action || '',
-          resourceType: row.audit_log_resourceType || '',
-          resourceId: row.audit_log_resourceId || '',
-          ipAddress: row.audit_log_ipAddress || '',
-          status: row.audit_log_status || '',
+          createdAt: sanitizeCsvValue(
+            row.audit_log_createdAt
+              ? new Date(row.audit_log_createdAt).toISOString()
+              : '',
+          ),
+          actorId: sanitizeCsvValue(row.audit_log_actorId || ''),
+          action: sanitizeCsvValue(row.audit_log_action || ''),
+          resourceType: sanitizeCsvValue(row.audit_log_resourceType || ''),
+          resourceId: sanitizeCsvValue(row.audit_log_resourceId || ''),
+          ipAddress: sanitizeCsvValue(row.audit_log_ipAddress || ''),
+          status: sanitizeCsvValue(row.audit_log_status || ''),
         });
       }
     } catch (err: any) {

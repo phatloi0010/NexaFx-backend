@@ -8,13 +8,23 @@
  */
 
 /** Characters a spreadsheet treats as the start of a formula. */
-const FORMULA_PREFIXES = ['=', '+', '-', '@'];
+export const FORMULA_PREFIXES = ['=', '+', '-', '@'];
+
+/**
+ * Neutralises leading formula characters (=, +, -, @) with a leading single quote
+ * so spreadsheet software treats the cell as literal text.
+ */
+export function sanitizeCsvValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  const raw = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  return raw.length > 0 && FORMULA_PREFIXES.includes(raw[0]) ? `'${raw}` : raw;
+}
 
 /** Quotes one CSV field, always, so embedded separators cannot shift a column. */
 export function escapeCsvField(value: unknown): string {
-  const raw = value === null || value === undefined ? '' : String(value);
-  const neutralised =
-    raw.length > 0 && FORMULA_PREFIXES.includes(raw[0]) ? `'${raw}` : raw;
+  const neutralised = sanitizeCsvValue(value);
   return `"${neutralised.replace(/"/g, '""')}"`;
 }
 
