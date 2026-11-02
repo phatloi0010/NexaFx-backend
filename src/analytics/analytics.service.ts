@@ -5,9 +5,11 @@ import {
   BadRequestException,
   Logger,
   ForbiddenException,
+  Optional,
+  Inject,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource, In, Between, MoreThanOrEqual } from 'typeorm';
+import { Repository, DataSource, In, Between, MoreThanOrEqual, LessThan } from 'typeorm';
 import Decimal from 'decimal.js';
 import * as fastCsv from 'fast-csv';
 import * as PDFDocument from 'pdfkit';
@@ -22,6 +24,10 @@ import { UsersService } from '../users/users.service';
 import { User } from '../users/user.entity';
 import { TransactionCategory } from './entities/transaction-category.entity';
 import { BalanceSnapshot } from './entities/balance-snapshot.entity';
+import {
+  STORAGE_SERVICE_TOKEN,
+  StorageService,
+} from '../modules/storage/storage.service';
 import {
   ReportExportJob,
   ExportJobStatus,
@@ -88,6 +94,9 @@ export class AnalyticsService {
     private readonly usersService: UsersService,
     private readonly exchangeRatesService: ExchangeRatesService,
     private readonly dataSource: DataSource,
+    @Optional()
+    @Inject(STORAGE_SERVICE_TOKEN)
+    private readonly storageService?: StorageService,
   ) {}
 
   async getSystemCategories(): Promise<TransactionCategory[]> {
@@ -398,51 +407,93 @@ export class AnalyticsService {
     return saved;
   }
 
+  private readonly EXPORT_PROCESSING_TIMEOUT_MS = 60000;
+
   private async processExportJob(job: ReportExportJob): Promise<void> {
     await this.exportJobRepository.update(job.id, {
       status: ExportJobStatus.PROCESSING,
     });
 
     try {
-      const transactions = await this.transactionRepository.find({
-        where: {
-          userId: job.userId,
-          createdAt: Between(job.fromDate, job.toDate),
-        },
-        order: { createdAt: 'ASC' },
-      });
+      const processingPromise = (async () => {
+        const transactions = await this.transactionRepository.find({
+          where: {
+            userId: job.userId,
+            createdAt: Between(job.fromDate, job.toDate),
+          },
+          order: { createdAt: 'ASC' },
+        });
 
-      const categories = await this.categoryRepository.find();
-      const categoryMap = new Map(categories.map((c) => [c.id, c]));
+        const categories = await this.categoryRepository.find();
+        const categoryMap = new Map(categories.map((c) => [c.id, c]));
 
-      let buffer: Buffer;
-      let filename: string;
-      let recordCount: number;
+        let buffer: Buffer;
+        let filename: string;
+        let recordCount: number;
+        let contentType: string;
 
-      if (job.format === ExportFormat.CSV) {
-        const result = await this.generateCsv(transactions, categoryMap);
-        buffer = result.buffer;
-        recordCount = result.count;
-        filename = `report-${job.id.slice(0, 8)}.csv`;
-      } else {
-        const result = await this.generatePdf(
-          transactions,
-          categoryMap,
-          job.fromDate,
-          job.toDate,
+        if (job.format === ExportFormat.CSV) {
+          const result = await this.generateCsv(transactions, categoryMap);
+          buffer = result.buffer;
+          recordCount = result.count;
+          filename = `report-${job.id.slice(0, 8)}.csv`;
+          contentType = 'text/csv';
+        } else {
+          const result = await this.generatePdf(
+            transactions,
+            categoryMap,
+            job.fromDate,
+            job.toDate,
+          );
+          buffer = result.buffer;
+          recordCount = result.count;
+          filename = `report-${job.id.slice(0, 8)}.pdf`;
+          contentType = 'application/pdf';
+        }
+
+        let fileUrl: string | null = null;
+        let s3Url: string | null = null;
+
+        if (this.storageService) {
+          const multerFile: Express.Multer.File = {
+            buffer,
+            originalname: filename,
+            mimetype: contentType,
+            size: buffer.length,
+            fieldname: 'file',
+            encoding: '7bit',
+            destination: '',
+            filename,
+            path: '',
+            stream: null as any,
+          };
+          const storageKey = await this.storageService.upload(
+            multerFile,
+            'exports',
+          );
+          fileUrl = storageKey;
+          s3Url = storageKey;
+        }
+
+        await this.exportJobRepository.update(job.id, {
+          status: ExportJobStatus.COMPLETED,
+          filename,
+          fileUrl,
+          s3Url,
+          fileSize: buffer.length,
+          recordCount,
+          completedAt: new Date(),
+        });
+      })();
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(
+          () => reject(new Error('Export processing timed out')),
+          this.EXPORT_PROCESSING_TIMEOUT_MS,
         );
-        buffer = result.buffer;
-        recordCount = result.count;
-        filename = `report-${job.id.slice(0, 8)}.pdf`;
-      }
-
-      await this.exportJobRepository.update(job.id, {
-        status: ExportJobStatus.COMPLETED,
-        filename,
-        fileSize: buffer.length,
-        recordCount,
-        completedAt: new Date(),
       });
+
+      await Promise.race([processingPromise, timeoutPromise]);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       await this.exportJobRepository.update(job.id, {
@@ -487,113 +538,161 @@ export class AnalyticsService {
     });
   }
 
-  private async generatePdf(
+  async generatePdf(
     transactions: Transaction[],
     categoryMap: Map<string, TransactionCategory>,
     fromDate: Date,
     toDate: Date,
   ): Promise<{ buffer: Buffer; count: number }> {
     return new Promise((resolve, reject) => {
-      const doc = new PDFDocument();
-      const chunks: Buffer[] = [];
+      try {
+        const doc = new PDFDocument({ margin: 50 });
+        const chunks: Buffer[] = [];
 
-      doc.on('data', (chunk) => chunks.push(chunk));
-      doc.on('end', () => {
-        resolve({ buffer: Buffer.concat(chunks), count: transactions.length });
-      });
-      doc.on('error', reject);
+        doc.on('data', (chunk) => chunks.push(chunk));
+        doc.on('end', () => {
+          resolve({
+            buffer: Buffer.concat(chunks),
+            count: transactions.length,
+          });
+        });
+        doc.on('error', (err) => reject(err));
 
-      doc.fontSize(20).text('NexaFX Spending Report', { align: 'center' });
-      doc.moveDown();
-      doc
-        .fontSize(12)
-        .text(
-          `Period: ${fromDate.toLocaleDateString()} - ${toDate.toLocaleDateString()}`,
-          { align: 'center' },
-        );
-      doc.moveDown();
-
-      const successful = transactions.filter(
-        (t) => t.status === TransactionStatus.SUCCESS,
-      );
-      const deposits = successful.filter(
-        (t) => t.type === TransactionType.DEPOSIT,
-      );
-      const withdrawals = successful.filter(
-        (t) => t.type === TransactionType.WITHDRAW,
-      );
-
-      const totalDeposits = deposits.reduce(
-        (s, t) => s + parseFloat(t.amount),
-        0,
-      );
-      const totalWithdrawals = withdrawals.reduce(
-        (s, t) => s + parseFloat(t.amount),
-        0,
-      );
-
-      doc.fontSize(14).text('Monthly Summary', { underline: true });
-      doc.fontSize(10);
-      doc.text(`Total Received: ${totalDeposits.toFixed(2)}`);
-      doc.text(`Total Sent: ${totalWithdrawals.toFixed(2)}`);
-      doc.text(`Net Flow: ${(totalDeposits - totalWithdrawals).toFixed(2)}`);
-      doc.moveDown();
-
-      const categoryBuckets = new Map<
-        string,
-        { amount: number; count: number }
-      >();
-      for (const tx of successful) {
-        const catId = tx.metadata?.categoryId || 'uncategorized';
-        const b = categoryBuckets.get(catId) || { amount: 0, count: 0 };
-        b.amount += parseFloat(tx.amount);
-        b.count += 1;
-        categoryBuckets.set(catId, b);
-      }
-
-      doc.fontSize(14).text('Category Breakdown', { underline: true });
-      const totalAmount = Array.from(categoryBuckets.values()).reduce(
-        (s, b) => s + b.amount,
-        0,
-      );
-
-      let y = doc.y;
-      for (const [catId, { amount, count }] of categoryBuckets) {
-        const cat = categoryMap.get(catId === 'uncategorized' ? '' : catId);
-        const name = cat?.name || 'Uncategorized';
-        const pct =
-          totalAmount > 0 ? ((amount / totalAmount) * 100).toFixed(1) : '0';
+        // Header and date range
+        doc.fontSize(20).text('NexaFX Spending Report', { align: 'center' });
+        doc.moveDown(0.5);
+        const fromStr = fromDate instanceof Date ? fromDate.toLocaleDateString() : String(fromDate);
+        const toStr = toDate instanceof Date ? toDate.toLocaleDateString() : String(toDate);
         doc
-          .fontSize(10)
-          .text(
-            `${name}: ${amount.toFixed(2)} (${pct}%) - ${count} tx(s)`,
-            50,
-            y,
-          );
-        y += 18;
-      }
-      doc.moveDown();
+          .fontSize(11)
+          .text(`Date Range: ${fromStr} - ${toStr}`, { align: 'center' });
+        doc.moveDown(1);
 
-      doc.fontSize(14).text('Transaction Details', { underline: true });
-      doc.fontSize(8);
-      let ty = doc.y;
-      for (const tx of transactions) {
-        const catId = tx.metadata?.categoryId;
-        const cat = catId ? categoryMap.get(catId) : null;
-        if (ty > 720) {
-          doc.addPage();
-          ty = 50;
-        }
-        doc.text(
-          `${tx.createdAt.toLocaleDateString()} | ${tx.type} | ${tx.amount} ${tx.currency} | ${tx.status} | ${cat?.name || 'Uncategorized'}`,
-          50,
-          ty,
+        const successful = transactions.filter(
+          (t) => t.status === TransactionStatus.SUCCESS,
         );
-        ty += 14;
-      }
+        const deposits = successful.filter(
+          (t) => t.type === TransactionType.DEPOSIT,
+        );
+        const withdrawals = successful.filter(
+          (t) => t.type === TransactionType.WITHDRAW,
+        );
 
-      doc.fontSize(8).text('Generated by NexaFX', { align: 'center' });
-      doc.end();
+        const totalDeposits = deposits.reduce(
+          (s, t) => s + parseFloat(t.amount || '0'),
+          0,
+        );
+        const totalWithdrawals = withdrawals.reduce(
+          (s, t) => s + parseFloat(t.amount || '0'),
+          0,
+        );
+
+        doc.fontSize(13).text('Summary', { underline: true });
+        doc.moveDown(0.3);
+        doc.fontSize(10);
+        doc.text(`Total Deposits: ${totalDeposits.toFixed(2)}`);
+        doc.text(`Total Withdrawals: ${totalWithdrawals.toFixed(2)}`);
+        doc.text(`Net Flow: ${(totalDeposits - totalWithdrawals).toFixed(2)}`);
+        doc.text(`Total Transactions: ${transactions.length}`);
+        doc.moveDown(1);
+
+        const categoryBuckets = new Map<
+          string,
+          { amount: number; count: number }
+        >();
+        for (const tx of successful) {
+          const catId = tx.metadata?.categoryId || 'uncategorized';
+          const b = categoryBuckets.get(catId) || { amount: 0, count: 0 };
+          b.amount += parseFloat(tx.amount || '0');
+          b.count += 1;
+          categoryBuckets.set(catId, b);
+        }
+
+        if (categoryBuckets.size > 0) {
+          doc.fontSize(13).text('Category Breakdown', { underline: true });
+          doc.moveDown(0.3);
+          const totalAmount = Array.from(categoryBuckets.values()).reduce(
+            (s, b) => s + b.amount,
+            0,
+          );
+
+          for (const [catId, { amount, count }] of categoryBuckets) {
+            const cat = categoryMap.get(catId === 'uncategorized' ? '' : catId);
+            const name = cat?.name || 'Uncategorized';
+            const pct =
+              totalAmount > 0 ? ((amount / totalAmount) * 100).toFixed(1) : '0';
+            doc
+              .fontSize(10)
+              .text(
+                `${name}: ${amount.toFixed(2)} (${pct}%) - ${count} tx(s)`,
+              );
+          }
+          doc.moveDown(1);
+        }
+
+        // Transaction Details Table
+        doc.fontSize(13).text('Transactions', { underline: true });
+        doc.moveDown(0.5);
+
+        const tableTop = doc.y;
+        const colDate = 50;
+        const colType = 130;
+        const colAmount = 210;
+        const colStatus = 310;
+        const colCategory = 400;
+
+        doc
+          .fontSize(9)
+          .font('Helvetica-Bold')
+          .text('Date', colDate, tableTop)
+          .text('Type', colType, tableTop)
+          .text('Amount', colAmount, tableTop)
+          .text('Status', colStatus, tableTop)
+          .text('Category', colCategory, tableTop);
+
+        doc
+          .moveTo(50, tableTop + 12)
+          .lineTo(540, tableTop + 12)
+          .stroke();
+
+        let yPos = tableTop + 18;
+        doc.font('Helvetica');
+
+        for (const tx of transactions) {
+          if (yPos > 720) {
+            doc.addPage();
+            yPos = 50;
+          }
+
+          const catId = tx.metadata?.categoryId;
+          const cat = catId ? categoryMap.get(catId) : null;
+          const txDate = tx.createdAt ? new Date(tx.createdAt).toLocaleDateString() : '';
+          const txAmount = `${tx.amount} ${tx.currency || ''}`;
+          const catName = cat?.name || 'Uncategorized';
+
+          doc
+            .fontSize(8)
+            .text(txDate, colDate, yPos, { width: 75 })
+            .text(tx.type || '', colType, yPos, { width: 75 })
+            .text(txAmount, colAmount, yPos, { width: 95 })
+            .text(tx.status || '', colStatus, yPos, { width: 85 })
+            .text(catName, colCategory, yPos, { width: 140 });
+
+          yPos += 16;
+        }
+
+        doc.y = yPos + 10;
+        if (doc.y > 740) {
+          doc.addPage();
+          doc.y = 50;
+        }
+        doc.moveDown(1);
+        doc.fontSize(8).text('Generated by NexaFX', { align: 'center' });
+
+        doc.end();
+      } catch (err) {
+        reject(err);
+      }
     });
   }
 
@@ -666,6 +765,21 @@ export class AnalyticsService {
     return cat?.id || null;
   }
 
+  async failStuckJobs(timeoutMs = 5 * 60 * 1000): Promise<number> {
+    const cutoff = new Date(Date.now() - timeoutMs);
+    const result = await this.exportJobRepository.update(
+      {
+        status: ExportJobStatus.PROCESSING,
+        updatedAt: LessThan(cutoff),
+      },
+      {
+        status: ExportJobStatus.FAILED,
+        errorMessage: 'Export job stuck in PROCESSING timed out',
+      },
+    );
+    return result.affected || 0;
+  }
+
   async getExportJob(jobId: string, userId: string): Promise<ReportExportJob> {
     const job = await this.exportJobRepository.findOne({
       where: { id: jobId, userId },
@@ -673,20 +787,37 @@ export class AnalyticsService {
     if (!job) {
       throw new NotFoundException('Export job not found');
     }
+
+    const STUCK_TIMEOUT_MS = 5 * 60 * 1000;
+    if (
+      job.status === ExportJobStatus.PROCESSING &&
+      job.updatedAt &&
+      Date.now() - new Date(job.updatedAt).getTime() > STUCK_TIMEOUT_MS
+    ) {
+      await this.exportJobRepository.update(job.id, {
+        status: ExportJobStatus.FAILED,
+        errorMessage: 'Export processing timed out',
+      });
+      job.status = ExportJobStatus.FAILED;
+      job.errorMessage = 'Export processing timed out';
+    }
+
     return job;
   }
 
   /**
-   * Rebuilds the export artifact for a completed job.
-   *
-   * The generated buffer is not persisted (the job row only keeps the
-   * filename and size), so the download route re-renders the same window
-   * with the same renderer the job was produced with.
+   * Retrieves the export artifact from storage or re-renders as fallback.
    */
   async getExportFile(
     jobId: string,
     userId: string,
-  ): Promise<{ buffer: Buffer; contentType: string; filename: string }> {
+  ): Promise<{
+    buffer: Buffer;
+    stream?: NodeJS.ReadableStream;
+    contentType: string;
+    filename: string;
+    fileSize: number;
+  }> {
     const job = await this.getExportJob(jobId, userId);
 
     if (job.status !== ExportJobStatus.COMPLETED) {
@@ -695,36 +826,62 @@ export class AnalyticsService {
       );
     }
 
-    const transactions = await this.transactionRepository.find({
-      where: {
-        userId: job.userId,
-        createdAt: Between(job.fromDate, job.toDate),
-      },
-      order: { createdAt: 'ASC' },
-    });
-    const categories = await this.categoryRepository.find();
-    const categoryMap = new Map(categories.map((c) => [c.id, c]));
+    const contentType =
+      job.format === ExportFormat.PDF ? 'application/pdf' : 'text/csv';
     const fallback = `report-${job.id.slice(0, 8)}`;
+    const filename =
+      job.filename ??
+      `${fallback}.${job.format === ExportFormat.PDF ? 'pdf' : 'csv'}`;
 
-    if (job.format === ExportFormat.CSV) {
-      const { buffer } = await this.generateCsv(transactions, categoryMap);
-      return {
-        buffer,
-        contentType: 'text/csv',
-        filename: job.filename ?? `${fallback}.csv`,
-      };
+    const storageKey = job.fileUrl || job.s3Url;
+    let buffer: Buffer | null = null;
+    let stream: NodeJS.ReadableStream | undefined;
+
+    if (this.storageService && storageKey) {
+      if (typeof this.storageService.getFile === 'function') {
+        buffer = await this.storageService.getFile(storageKey);
+      }
+      if (typeof this.storageService.getFileStream === 'function') {
+        stream = await this.storageService.getFileStream(storageKey);
+      }
     }
 
-    const { buffer } = await this.generatePdf(
-      transactions,
-      categoryMap,
-      job.fromDate,
-      job.toDate,
-    );
+    if (!buffer) {
+      const transactions = await this.transactionRepository.find({
+        where: {
+          userId: job.userId,
+          createdAt: Between(job.fromDate, job.toDate),
+        },
+        order: { createdAt: 'ASC' },
+      });
+      const categories = await this.categoryRepository.find();
+      const categoryMap = new Map(categories.map((c) => [c.id, c]));
+
+      if (job.format === ExportFormat.CSV) {
+        const res = await this.generateCsv(transactions, categoryMap);
+        buffer = res.buffer;
+      } else {
+        const res = await this.generatePdf(
+          transactions,
+          categoryMap,
+          job.fromDate,
+          job.toDate,
+        );
+        buffer = res.buffer;
+      }
+    }
+
+    if (!stream && buffer) {
+      const { Readable } = await import('stream');
+      stream = Readable.from(buffer);
+    }
+
     return {
       buffer,
-      contentType: 'application/pdf',
-      filename: job.filename ?? `${fallback}.pdf`,
+      stream,
+      contentType,
+      filename,
+      fileSize: job.fileSize ?? buffer.length,
     };
   }
 }

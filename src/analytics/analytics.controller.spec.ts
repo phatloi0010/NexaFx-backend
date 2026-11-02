@@ -1,3 +1,29 @@
+jest.mock('@nestjs/config', () => ({
+  ConfigService: class MockConfigService {
+    get() {
+      return null;
+    }
+  },
+}));
+jest.mock('@nestjs/typeorm', () => {
+  const { Inject } = require('@nestjs/common');
+  const getRepositoryToken = (entity: any) =>
+    (entity?.name ?? 'Entity') + 'Repository';
+  return {
+    InjectRepository: (entity: any) => Inject(getRepositoryToken(entity)),
+    getRepositoryToken,
+  };
+});
+jest.mock('@nestjs/swagger', () => ({
+  ApiTags: () => () => {},
+  ApiBearerAuth: () => () => {},
+  ApiOperation: () => () => {},
+  ApiResponse: () => () => {},
+  ApiParam: () => () => {},
+  ApiQuery: () => () => {},
+  ApiProperty: () => () => {},
+  ApiPropertyOptional: () => () => {},
+}));
 import { Test, TestingModule } from '@nestjs/testing';
 import { NotFoundException } from '@nestjs/common';
 import { AnalyticsController, TransactionCategoryController } from './analytics.controller';

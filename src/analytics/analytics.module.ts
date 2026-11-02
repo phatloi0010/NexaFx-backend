@@ -12,6 +12,7 @@ import { Transaction } from '../transactions/entities/transaction.entity';
 import { User } from '../users/user.entity';
 import { ExchangeRatesModule } from '../exchange-rates/exchange-rates.module';
 import { UsersModule } from '../users/users.module';
+import { StorageModule } from '../modules/storage/storage.module';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { UsersModule } from '../users/users.module';
     ]),
     ExchangeRatesModule,
     UsersModule,
+    StorageModule,
   ],
   controllers: [AnalyticsController, TransactionCategoryController],
   providers: [AnalyticsService],

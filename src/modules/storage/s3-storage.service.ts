@@ -75,4 +75,22 @@ export class S3StorageService implements StorageService {
       }),
     );
   }
+  async getFileStream(key: string): Promise<NodeJS.ReadableStream> {
+    const command = new GetObjectCommand({
+      Bucket: this.bucketName,
+      Key: key,
+    });
+    const response = await this.s3Client.send(command);
+    return response.Body as NodeJS.ReadableStream;
+  }
+
+  async getFile(key: string): Promise<Buffer> {
+    const command = new GetObjectCommand({
+      Bucket: this.bucketName,
+      Key: key,
+    });
+    const response = await this.s3Client.send(command);
+    const byteArray = await response.Body?.transformToByteArray();
+    return Buffer.from(byteArray || []);
+  }
 }

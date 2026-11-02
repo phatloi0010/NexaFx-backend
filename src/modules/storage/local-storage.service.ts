@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, Logger } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, Logger } from '@nestjs/common';
 import { StorageService } from './storage.service';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -69,5 +69,34 @@ export class LocalStorageService implements StorageService {
       fs.unlinkSync(fullPath);
       this.logger.log(`Deleted file from local storage: ${key}`);
     }
+  }
+  async getFileStream(key: string): Promise<NodeJS.ReadableStream> {
+    const sanitizedKey = key.replace(/\.\./g, '');
+    const fullPath = path.resolve(this.uploadsBase, sanitizedKey);
+
+    if (!fullPath.startsWith(this.uploadsBase)) {
+      throw new BadRequestException('Path traversal detected');
+    }
+
+    if (!fs.existsSync(fullPath)) {
+      throw new NotFoundException('File not found');
+    }
+
+    return fs.createReadStream(fullPath);
+  }
+
+  async getFile(key: string): Promise<Buffer> {
+    const sanitizedKey = key.replace(/\.\./g, '');
+    const fullPath = path.resolve(this.uploadsBase, sanitizedKey);
+
+    if (!fullPath.startsWith(this.uploadsBase)) {
+      throw new BadRequestException('Path traversal detected');
+    }
+
+    if (!fs.existsSync(fullPath)) {
+      throw new NotFoundException('File not found');
+    }
+
+    return fs.readFileSync(fullPath);
   }
 }

@@ -105,9 +105,9 @@ export class AnalyticsController {
     @Param('id') id: string,
     @Res() res: Response,
   ) {
-    const { buffer, contentType, filename } =
+    const { buffer, stream, contentType, filename, fileSize } =
       await this.analyticsService.getExportFile(id, req.user.userId);
-    if (!buffer) {
+    if (!buffer && !stream) {
       throw new NotFoundException('Export file not available');
     }
     res.setHeader('Content-Type', contentType);
@@ -115,7 +115,19 @@ export class AnalyticsController {
       'Content-Disposition',
       `attachment; filename="${filename}"`,
     );
-    res.send(buffer);
+    if (fileSize) {
+      res.setHeader('Content-Length', fileSize.toString());
+    }
+    if (
+      stream &&
+      typeof (stream as any).pipe === 'function' &&
+      typeof (res as any).write === 'function' &&
+      typeof (res as any).once === 'function'
+    ) {
+      (stream as any).pipe(res);
+    } else {
+      res.send(buffer);
+    }
   }
 }
 
